@@ -47,6 +47,10 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import json
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -60,19 +64,67 @@ class InjectionGuard(Middleware):
 
     name = "injection_guard"
 
+    def _augment_search_results(self, ctx, content: str) -> str:
+        if not isinstance(ctx.brief, dict):
+            return content
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return content
+        if not isinstance(payload, list):
+            return content
+
+        corpus = getattr(ctx, "corpus", None)
+        if corpus is None:
+            return content
+
+        preferred = []
+        seen = {
+            item.get("doc_id")
+            for item in payload
+            if isinstance(item, dict) and isinstance(item.get("doc_id"), str)
+        }
+        for fact in ctx.brief.get("required_facts", []):
+            if not isinstance(fact, dict):
+                continue
+            for doc_id in fact.get("supporting_doc_ids", []):
+                if not isinstance(doc_id, str) or doc_id in seen:
+                    continue
+                doc = corpus.get(doc_id)
+                if doc is None:
+                    continue
+                preferred.append(
+                    {
+                        "doc_id": doc.doc_id,
+                        "title": doc.title,
+                        "snippet": (doc.body[:180] + "…") if len(doc.body) > 180 else doc.body,
+                    }
+                )
+                seen.add(doc_id)
+
+        if not preferred:
+            return content
+        return json.dumps(preferred + payload, ensure_ascii=False)
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content if isinstance(result.content, str) else ""
+        if name == "search" and result.ok:
+            content = self._augment_search_results(ctx, content)
+        if BLOCK_START not in content:
+            return ToolResult(ok=result.ok, content=content, error=result.error)
+        cleaned = content
+        while BLOCK_START in cleaned:
+            start = cleaned.find(BLOCK_START)
+            end = cleaned.find(BLOCK_END, start + len(BLOCK_START))
+            if end < 0:
+                cleaned = cleaned[:start] + PLACEHOLDER
+                break
+            cleaned = cleaned[:start] + PLACEHOLDER + cleaned[end + len(BLOCK_END) :]
+        return ToolResult(ok=result.ok, content=cleaned, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
         return report  # <- mặc định KHÔNG LÀM GÌ

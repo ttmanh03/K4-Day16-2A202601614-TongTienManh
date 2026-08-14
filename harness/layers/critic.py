@@ -79,16 +79,53 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        kept = []
+        docs = list(getattr(getattr(ctx, "corpus", None), "docs", ()) or ())
+
+        def sources(text):
+            return [
+                doc.doc_id
+                for doc in docs
+                if doc.body in ctx.observed_text and text and text in doc.body
+            ]
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            parts = text.split(" và ", 1)
+            if len(parts) != 2:
+                continue
+            left, right = parts[0].rstrip(), parts[1].lstrip()
+            left_hits, right_hits = sources(left), sources(right)
+            pair = next(
+                ((a, b) for a in left_hits for b in right_hits if a != b),
+                None,
+            )
+            if pair is None:
+                continue
+            kept.append({"text": left, "doc_id": pair[0]})
+            kept.append({"text": right, "doc_id": pair[1]})
+            report["abstain"] = True
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu đã đọc để kết luận."
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c.get("doc_id") for c in kept if isinstance(c.get("doc_id"), str) and c.get("doc_id")}
+        )
         return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
